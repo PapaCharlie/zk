@@ -3,6 +3,7 @@ package zk
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"reflect"
 	"runtime"
@@ -18,8 +19,8 @@ var (
 
 type defaultLogger struct{}
 
-func (defaultLogger) Printf(format string, a ...interface{}) {
-	log.Printf(format, a...)
+func (defaultLogger) Printf(format string, v ...interface{}) {
+	log.Output(3, fmt.Sprintf(format, v...))
 }
 
 type ACL struct {
@@ -256,10 +257,12 @@ type setSaslResponse struct {
 }
 
 type setWatchesRequest struct {
-	RelativeZxid int64
-	DataWatches  []string
-	ExistWatches []string
-	ChildWatches []string
+	RelativeZxid               int64
+	DataWatches                []string
+	ExistWatches               []string
+	ChildWatches               []string
+	PersistentWatches          []string
+	PersistentRecursiveWatches []string
 }
 
 type setWatchesResponse struct{}
@@ -300,6 +303,20 @@ type reconfigRequest struct {
 }
 
 type reconfigReponse getDataResponse
+
+type addWatchRequest struct {
+	Path string
+	Mode AddWatchMode
+}
+
+type addWatchResponse struct{}
+
+type checkWatchesRequest struct {
+	Path string
+	Type WatcherType
+}
+
+type checkWatchesResponse struct{}
 
 func (r *multiRequest) Encode(buf []byte) (int, error) {
 	total := 0
@@ -622,7 +639,7 @@ func requestStructForOp(op int32) interface{} {
 		return &setAclRequest{}
 	case opSetData:
 		return &SetDataRequest{}
-	case opSetWatches:
+	case opSetWatches, opSetWatches2:
 		return &setWatchesRequest{}
 	case opSync:
 		return &syncRequest{}
@@ -634,6 +651,8 @@ func requestStructForOp(op int32) interface{} {
 		return &multiRequest{}
 	case opReconfig:
 		return &reconfigRequest{}
+	case opAddWatch:
+		return &addWatchRequest{}
 	}
 	return nil
 }

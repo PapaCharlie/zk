@@ -47,7 +47,13 @@ const (
 	watchTypeData watchType = iota
 	watchTypeExist
 	watchTypeChild
+	watchTypePersistent
+	watchTypePersistentRecursive
 )
+
+func (w watchType) isPersistent() bool {
+	return w == watchTypePersistent || w == watchTypePersistentRecursive
+}
 
 type watchPathType struct {
 	path  string
@@ -530,29 +536,47 @@ func (c *Conn) flushRequests(err error) {
 	c.requestsLock.Unlock()
 }
 
+var eventWatchTypes = map[EventType][]watchType{
+	EventNodeCreated:         {watchTypeExist, watchTypePersistent, watchTypePersistentRecursive},
+	EventNodeDataChanged:     {watchTypeExist, watchTypeData, watchTypePersistent, watchTypePersistentRecursive},
+	EventNodeChildrenChanged: {watchTypeChild, watchTypePersistent},
+	EventNodeDeleted:         {watchTypeExist, watchTypeData, watchTypeChild, watchTypePersistent, watchTypePersistentRecursive},
+}
+var persistentWatchTypes = []watchType{watchTypePersistent, watchTypePersistentRecursive}
+
 // Send event to all interested watchers
 func (c *Conn) notifyWatches(ev Event) {
-	var wTypes []watchType
-	switch ev.Type {
-	case EventNodeCreated:
-		wTypes = []watchType{watchTypeExist}
-	case EventNodeDataChanged:
-		wTypes = []watchType{watchTypeExist, watchTypeData}
-	case EventNodeChildrenChanged:
-		wTypes = []watchType{watchTypeChild}
-	case EventNodeDeleted:
-		wTypes = []watchType{watchTypeExist, watchTypeData, watchTypeChild}
+	wTypes := eventWatchTypes[ev.Type]
+	if len(wTypes) == 0 {
+		return
 	}
+
 	c.watchersLock.Lock()
 	defer c.watchersLock.Unlock()
-	for _, t := range wTypes {
-		wpt := watchPathType{ev.Path, t}
-		if watchers := c.watchers[wpt]; len(watchers) > 0 {
-			for _, ch := range watchers {
-				ch <- ev
+
+	broadcast := func(wpt watchPathType) {
+		for _, ch := range c.watchers[wpt] {
+			ch <- ev
+			if !wpt.wType.isPersistent() {
 				close(ch)
 			}
-			delete(c.watchers, wpt)
+		}
+	}
+
+	for _, t := range wTypes {
+		if t == watchTypePersistentRecursive {
+			for p := ev.Path; ; p, _ = SplitPath(p) {
+				broadcast(watchPathType{p, t})
+				if p == "/" {
+					break
+				}
+			}
+		} else {
+			wpt := watchPathType{ev.Path, t}
+			broadcast(wpt)
+			if !t.isPersistent() {
+				delete(c.watchers, wpt)
+			}
 		}
 	}
 }
@@ -562,8 +586,15 @@ func (c *Conn) invalidateWatches(err error) {
 	c.watchersLock.Lock()
 	defer c.watchersLock.Unlock()
 
-	if len(c.watchers) >= 0 {
+	if len(c.watchers) > 0 {
 		for pathType, watchers := range c.watchers {
+			if err == ErrSessionExpired && pathType.wType.isPersistent() {
+				// Ignore ErrSessionExpired for persistent watchers as the client will either automatically reconnect,
+				// or this is a shutdown-worthy error in which case there will be a followup invocation of this method
+				// with ErrClosing
+				continue
+			}
+
 			ev := Event{Type: EventNotWatching, State: StateDisconnected, Path: pathType.path, Err: err}
 			c.sendEvent(ev) // also publish globally
 			for _, ch := range watchers {
@@ -610,12 +641,7 @@ func (c *Conn) sendSetWatches() {
 				reqs = append(reqs, req)
 			}
 			sizeSoFar = 28 // fixed overhead of a set-watches packet
-			req = &setWatchesRequest{
-				RelativeZxid: c.lastZxid,
-				DataWatches:  make([]string, 0),
-				ExistWatches: make([]string, 0),
-				ChildWatches: make([]string, 0),
-			}
+			req = &setWatchesRequest{RelativeZxid: c.lastZxid}
 		}
 		sizeSoFar += addlLen
 		switch pathType.wType {
@@ -625,6 +651,10 @@ func (c *Conn) sendSetWatches() {
 			req.ExistWatches = append(req.ExistWatches, pathType.path)
 		case watchTypeChild:
 			req.ChildWatches = append(req.ChildWatches, pathType.path)
+		case watchTypePersistent:
+			req.PersistentWatches = append(req.PersistentWatches, pathType.path)
+		case watchTypePersistentRecursive:
+			req.PersistentRecursiveWatches = append(req.PersistentRecursiveWatches, pathType.path)
 		}
 		n++
 	}
@@ -646,7 +676,37 @@ func (c *Conn) sendSetWatches() {
 		// aren't failure modes where a blocking write to the channel of requests
 		// could hang indefinitely and cause this goroutine to leak...
 		for _, req := range reqs {
-			_, err := c.request(opSetWatches, req, res, nil)
+			var op int32 = opSetWatches
+			if len(req.PersistentWatches) > 0 || len(req.PersistentRecursiveWatches) > 0 {
+				// to maintain compatibility with older servers, only send opSetWatches2 if persistent watches are used
+				op = opSetWatches2
+			}
+
+			_, err := c.request(op, req, res, func(r *request, header *responseHeader, err error) {
+				if err == nil && op == opSetWatches2 {
+					// If the setWatches was successful, notify the persistent watchers they've been reconnected.
+					// Because we process responses in one routine, we know that the following will execute before
+					// subsequent responses are processed. This means we won't end up in a situation where events are
+					// sent to watchers before the reconnect event is sent.
+					c.watchersLock.Lock()
+					defer c.watchersLock.Unlock()
+					for _, wt := range persistentWatchTypes {
+						var paths []string
+						if wt == watchTypePersistent {
+							paths = req.PersistentWatches
+						} else {
+							paths = req.PersistentRecursiveWatches
+						}
+						for _, p := range paths {
+							e := Event{Type: EventWatching, State: StateConnected, Path: p}
+							c.sendEvent(e) // also publish globally
+							for _, ch := range c.watchers[watchPathType{path: p, wType: wt}] {
+								ch <- e
+							}
+						}
+					}
+				}
+			})
 			if err != nil {
 				c.logger.Printf("Failed to set previous watches: %v", err)
 				break
@@ -1050,13 +1110,17 @@ func (c *Conn) Set(path string, data []byte, version int32) (*Stat, error) {
 	return &res.Stat, err
 }
 
-// Create creates a znode.
+// Create creates a znode. If acl is nil, it uses the global WorldACL with PermAll
 // The returned path is the new path assigned by the server, it may not be the
 // same as the input, for example when creating a sequence znode the returned path
 // will be the input path with a sequence number appended.
 func (c *Conn) Create(path string, data []byte, flags int32, acl []ACL) (string, error) {
 	if err := validatePath(path, flags&FlagSequence == FlagSequence); err != nil {
 		return "", err
+	}
+
+	if acl == nil {
+		acl = WorldACL(PermAll)
 	}
 
 	res := &createResponse{}
@@ -1329,6 +1393,96 @@ func (c *Conn) Server() string {
 	c.serverMu.Lock()
 	defer c.serverMu.Unlock()
 	return c.server
+}
+
+func (c *Conn) AddPersistentWatch(path string, mode AddWatchMode) (ch <-chan Event, err error) {
+	if err = validatePath(path, false); err != nil {
+		return nil, err
+	}
+
+	res := &addWatchResponse{}
+	_, err = c.request(opAddWatch, &addWatchRequest{Path: path, Mode: mode}, res, func(r *request, header *responseHeader, err error) {
+		if err == nil {
+			var wt watchType
+			if mode == AddWatchModePersistent {
+				wt = watchTypePersistent
+			} else {
+				wt = watchTypePersistentRecursive
+			}
+			ch = c.addWatcher(path, wt)
+		}
+	})
+	if err == ErrConnectionClosed {
+		return nil, err
+	}
+	return ch, err
+}
+
+func (c *Conn) RemovePersistentWatch(path string, ch <-chan Event) (err error) {
+	if err = validatePath(path, false); err != nil {
+		return err
+	}
+
+	deleted := false
+
+	res := &checkWatchesResponse{}
+	_, err = c.request(opCheckWatches, &checkWatchesRequest{Path: path, Type: WatcherTypeAny}, res, func(r *request, header *responseHeader, err error) {
+		if err != nil {
+			return
+		}
+
+		c.watchersLock.Lock()
+		defer c.watchersLock.Unlock()
+
+		for _, wt := range persistentWatchTypes {
+			wpt := watchPathType{path: path, wType: wt}
+			for i, w := range c.watchers[wpt] {
+				if w == ch {
+					deleted = true
+					c.watchers[wpt] = append(c.watchers[wpt][:i], c.watchers[wpt][i+1:]...)
+					w <- Event{Type: EventNotWatching, State: c.State(), Path: path, Err: ErrNoWatcher}
+					close(w)
+					return
+				}
+			}
+		}
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if !deleted {
+		return ErrNoWatcher
+	}
+
+	return nil
+}
+
+func (c *Conn) RemoveAllPersistentWatches(path string) (err error) {
+	if err = validatePath(path, false); err != nil {
+		return err
+	}
+
+	res := &checkWatchesResponse{}
+	_, err = c.request(opRemoveWatches, &checkWatchesRequest{Path: path, Type: WatcherTypeAny}, res, func(r *request, header *responseHeader, err error) {
+		if err != nil {
+			return
+		}
+
+		c.watchersLock.Lock()
+		defer c.watchersLock.Unlock()
+		for _, wt := range persistentWatchTypes {
+			wpt := watchPathType{path: path, wType: wt}
+			e := Event{Type: EventNotWatching, State: StateDisconnected, Path: path, Err: ErrNoWatcher}
+			for _, ch := range c.watchers[wpt] {
+				ch <- e
+				close(ch)
+			}
+			delete(c.watchers, wpt)
+		}
+	})
+	return err
 }
 
 func resendZkAuth(ctx context.Context, c *Conn) error {
