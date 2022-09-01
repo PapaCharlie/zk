@@ -2,7 +2,6 @@ package zk
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -187,13 +186,8 @@ func TestCreateContainer(t *testing.T) {
 }
 
 func TestIncrementalReconfig(t *testing.T) {
-	if val, ok := os.LookupEnv("zk_version"); ok {
-		if !strings.HasPrefix(val, "3.5") {
-			t.Skip("running with zookeeper that does not support this api")
-		}
-	} else {
-		t.Skip("did not detect zk_version from env. skipping reconfig test")
-	}
+	requireMinimumZkVersion(t, "3.5")
+
 	ts, err := StartTestCluster(t, 3, nil, logWriter{t: t, p: "[ZKERR] "})
 	requireNoError(t, err, "failed to setup test cluster")
 	defer ts.Stop()
@@ -282,13 +276,7 @@ func TestIncrementalReconfig(t *testing.T) {
 }
 
 func TestReconfig(t *testing.T) {
-	if val, ok := os.LookupEnv("zk_version"); ok {
-		if !strings.HasPrefix(val, "3.5") {
-			t.Skip("running with zookeeper that does not support this api")
-		}
-	} else {
-		t.Skip("did not detect zk_version from env. skipping reconfig test")
-	}
+	requireMinimumZkVersion(t, "3.5")
 
 	// This test enures we can do an non-incremental reconfig
 	ts, err := StartTestCluster(t, 3, nil, logWriter{t: t, p: "[ZKERR] "})
@@ -604,6 +592,7 @@ func TestAuth(t *testing.T) {
 	}
 }
 
+// Tests that we correctly handle a response larger than the default buffer size
 func TestChildren(t *testing.T) {
 	ts, err := StartTestCluster(t, 1, nil, logWriter{t: t, p: "[ZKERR] "})
 	if err != nil {
@@ -622,38 +611,44 @@ func TestChildren(t *testing.T) {
 		}
 	}
 
-	deleteNode("/gozk-test-big")
+	testNode := "/gozk-test-big"
+	deleteNode(testNode)
 
-	if path, err := zk.Create("/gozk-test-big", []byte{1, 2, 3, 4}, 0, WorldACL(PermAll)); err != nil {
+	if _, err := zk.Create(testNode, nil, 0, WorldACL(PermAll)); err != nil {
 		t.Fatalf("Create returned error: %+v", err)
-	} else if path != "/gozk-test-big" {
-		t.Fatalf("Create returned different path '%s' != '/gozk-test-big'", path)
 	}
 
-	rb := make([]byte, 1000)
-	hb := make([]byte, 2000)
-	prefix := []byte("/gozk-test-big/")
-	for i := 0; i < 10000; i++ {
-		_, err := rand.Read(rb)
-		if err != nil {
-			t.Fatal("Cannot create random znode name")
-		}
-		hex.Encode(hb, rb)
+	const (
+		nodesToCreate = 100
+		// By creating many nodes with long names, the response from the Children call should be significantly longer
+		// than the buffer size, forcing recvLoop to allocate a bigger buffer
+		nameLength = 2 * bufferSize / nodesToCreate
+	)
 
-		expect := string(append(prefix, hb...))
-		if path, err := zk.Create(expect, []byte{1, 2, 3, 4}, 0, WorldACL(PermAll)); err != nil {
+	format := fmt.Sprintf("%%0%dd", nameLength)
+	if name := fmt.Sprintf(format, 0); len(name) != nameLength {
+		// Sanity check that the generated format string creates strings of the right length
+		t.Fatalf("Length of generated name was not %d, got %d", nameLength, len(name))
+	}
+
+	var createdNodes []string
+	for i := 0; i < nodesToCreate; i++ {
+		name := fmt.Sprintf(format, i)
+		createdNodes = append(createdNodes, name)
+		path := testNode + "/" + name
+		if _, err := zk.Create(path, nil, 0, WorldACL(PermAll)); err != nil {
 			t.Fatalf("Create returned error: %+v", err)
-		} else if path != expect {
-			t.Fatalf("Create returned different path '%s' != '%s'", path, expect)
 		}
-		defer deleteNode(string(expect))
+		defer deleteNode(path)
 	}
 
-	children, _, err := zk.Children("/gozk-test-big")
+	children, _, err := zk.Children(testNode)
 	if err != nil {
 		t.Fatalf("Children returned error: %+v", err)
-	} else if len(children) != 10000 {
-		t.Fatal("Children returned wrong number of nodes")
+	}
+	sort.Strings(children)
+	if !reflect.DeepEqual(children, createdNodes) {
+		t.Fatal("Children did not return expected nodes")
 	}
 }
 
@@ -765,10 +760,16 @@ func TestSetWatchers(t *testing.T) {
 		}
 	}()
 
-	// we create lots of paths to watch, to make sure a "set watches" request
-	// on re-create will be too big and be required to span multiple packets
-	for i := 0; i < 1000; i++ {
-		testPath, err := zk.Create(fmt.Sprintf("/gozk-test-%d", i), []byte{}, 0, WorldACL(PermAll))
+	// we create lots of long paths to watch, to make sure a "set watches" request on will be too big and be broken
+	// into multiple packets. The size is chosen such that each packet can hold exactly 2 watches, meaning we should
+	// see half as many packets as there are watches.
+	const (
+		watches               = 50
+		watchedNodeNameFormat = "/gozk-test-%0450d"
+	)
+
+	for i := 0; i < watches; i++ {
+		testPath, err := zk.Create(fmt.Sprintf(watchedNodeNameFormat, i), []byte{}, 0, WorldACL(PermAll))
 		if err != nil {
 			t.Fatalf("Create returned: %+v", err)
 		}
@@ -852,9 +853,9 @@ func TestSetWatchers(t *testing.T) {
 	buf := make([]byte, bufferSize)
 	totalWatches := 0
 	actualReqs := setWatchReqs.Load().([]*setWatchesRequest)
-	if len(actualReqs) < 12 {
-		// sanity check: we should have generated *at least* 12 requests to reset watches
-		t.Fatalf("too few setWatchesRequest messages: %d", len(actualReqs))
+	if len(actualReqs) != watches/2 {
+		// sanity check: we should have generated exactly 25 requests to reset watches
+		t.Fatalf("Did not send exactly %d setWatches requests, got %d instead", watches/2, len(actualReqs))
 	}
 	for _, r := range actualReqs {
 		totalWatches += len(r.ChildWatches) + len(r.DataWatches) + len(r.ExistWatches)

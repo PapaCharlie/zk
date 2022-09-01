@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -255,5 +256,31 @@ func requireNoError(t *testing.T, err error, msgAndArgs ...interface{}) {
 	if err != nil {
 		t.Logf("received unexpected error: %v", err)
 		t.Fatal(msgAndArgs...)
+	}
+}
+
+func requireMinimumZkVersion(t *testing.T, minimum string) {
+	if val, ok := os.LookupEnv("ZK_VERSION"); ok {
+		split := func(v string) (parts []int) {
+			for _, s := range strings.Split(minimum, ".") {
+				i, err := strconv.Atoi(s)
+				if err != nil {
+					t.Fatalf("invalid version segment: %q", s)
+				}
+				parts = append(parts, i)
+			}
+			return parts
+		}
+
+		minimumV, actualV := split(minimum), split(val)
+		for i, p := range minimumV {
+			if actualV[i] < p {
+				if !strings.HasPrefix(val, minimum) {
+					t.Skipf("running with zookeeper that does not support this api (requires at least %s)", minimum)
+				}
+			}
+		}
+	} else {
+		t.Skip("did not detect zk_version from env. skipping reconfig test")
 	}
 }
