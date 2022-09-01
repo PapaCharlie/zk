@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -119,77 +120,107 @@ func TestNotifyWatches(t *testing.T) {
 		watches map[watchPathType]bool
 	}{
 		{
-			EventNodeCreated, "/",
-			map[watchPathType]bool{
-				{"/", watchTypeExist}: true,
-				{"/", watchTypeChild}: false,
-				{"/", watchTypeData}:  false,
-			},
-		},
-		{
-			EventNodeCreated, "/a",
-			map[watchPathType]bool{
+			eType: EventNodeCreated,
+			path:  "/a",
+			watches: map[watchPathType]bool{
+				{"/a", watchTypeExist}: true,
 				{"/b", watchTypeExist}: false,
+
+				{"/a", watchTypeChild}: false,
+
+				{"/a", watchTypeData}: false,
+
+				{"/a", watchTypePersistent}: true,
+				{"/", watchTypePersistent}:  false,
+
+				{"/a", watchTypePersistentRecursive}: true,
+				{"/", watchTypePersistentRecursive}:  true,
 			},
 		},
 		{
-			EventNodeDataChanged, "/",
-			map[watchPathType]bool{
-				{"/", watchTypeExist}: true,
-				{"/", watchTypeData}:  true,
-				{"/", watchTypeChild}: false,
+			eType: EventNodeDataChanged,
+			path:  "/a",
+			watches: map[watchPathType]bool{
+				{"/a", watchTypeExist}: true,
+				{"/a", watchTypeData}:  true,
+				{"/a", watchTypeChild}: false,
+
+				{"/a", watchTypePersistent}: true,
+				{"/", watchTypePersistent}:  false,
+
+				{"/a", watchTypePersistentRecursive}: true,
+				{"/", watchTypePersistentRecursive}:  true,
 			},
 		},
 		{
-			EventNodeChildrenChanged, "/",
-			map[watchPathType]bool{
-				{"/", watchTypeExist}: false,
-				{"/", watchTypeData}:  false,
-				{"/", watchTypeChild}: true,
+			eType: EventNodeChildrenChanged,
+			path:  "/a",
+			watches: map[watchPathType]bool{
+				{"/a", watchTypeExist}:               false,
+				{"/a", watchTypeData}:                false,
+				{"/a", watchTypeChild}:               true,
+				{"/a", watchTypePersistent}:          true,
+				{"/a", watchTypePersistentRecursive}: false,
+
+				{"/a", watchTypePersistent}: true,
+				{"/", watchTypePersistent}:  false,
+
+				{"/a", watchTypePersistentRecursive}: false,
+				{"/", watchTypePersistentRecursive}:  false,
 			},
 		},
 		{
-			EventNodeDeleted, "/",
-			map[watchPathType]bool{
-				{"/", watchTypeExist}: true,
-				{"/", watchTypeData}:  true,
-				{"/", watchTypeChild}: true,
+			eType: EventNodeDeleted,
+			path:  "/a",
+			watches: map[watchPathType]bool{
+				{"/a", watchTypeExist}: true,
+				{"/a", watchTypeData}:  true,
+				{"/a", watchTypeChild}: true,
+
+				{"/a", watchTypePersistent}: true,
+				{"/", watchTypePersistent}:  false,
+
+				{"/a", watchTypePersistentRecursive}: true,
+				{"/", watchTypePersistentRecursive}:  true,
 			},
 		},
 	}
 
-	conn := &Conn{watchers: make(map[watchPathType][]chan Event)}
-
 	for idx, c := range cases {
+		c := c
 		t.Run(fmt.Sprintf("#%d %s", idx, c.eType), func(t *testing.T) {
-			c := c
-
 			notifications := make([]struct {
-				path   string
+				watchPathType
 				notify bool
 				ch     <-chan Event
 			}, len(c.watches))
 
+			conn := &Conn{watchers: make(map[watchPathType][]chan Event)}
+
 			var idx int
 			for wpt, expectEvent := range c.watches {
-				ch := conn.addWatcher(wpt.path, wpt.wType)
-				notifications[idx].path = wpt.path
+				notifications[idx].watchPathType = wpt
 				notifications[idx].notify = expectEvent
-				notifications[idx].ch = ch
+				notifications[idx].ch = conn.addWatcher(wpt.path, wpt.wType)
 				idx++
 			}
-			ev := Event{Type: c.eType, Path: c.path}
-			conn.notifyWatches(ev)
+
+			conn.notifyWatches(Event{Type: c.eType, Path: c.path})
 
 			for _, res := range notifications {
 				select {
 				case e := <-res.ch:
-					if !res.notify || e.Path != res.path {
-						t.Fatal("unexpeted notification received")
+					isPathCorrect :=
+						(res.wType == watchTypePersistentRecursive && strings.HasPrefix(e.Path, res.path)) ||
+							e.Path == res.path
+					if !res.notify || !isPathCorrect {
+						t.Logf("unexpeted notification received by %+v: %+v", res, e)
+						t.Fail()
 					}
 				default:
 					if res.notify {
-						t.Fatal("expected notification not received")
+						t.Logf("expected notification not received for %+v", res)
+						t.Fail()
 					}
 				}
 			}

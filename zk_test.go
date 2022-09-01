@@ -1,6 +1,7 @@
 package zk
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -388,6 +389,134 @@ func TestMulti(t *testing.T) {
 	}
 }
 
+func TestMultiRead(t *testing.T) {
+	RequireMinimumZkVersion(t, "3.6")
+	WithTestCluster(t, 10*time.Second, func(ts *TestCluster, zk *Conn) {
+		nodeChildren := map[string][]string{}
+		nodeData := map[string][]byte{}
+		var ops []ReadOp
+
+		create := func(path string, data []byte) {
+			if _, err := zk.Create(path, data, 0, nil); err != nil {
+				requireNoErrorf(t, err, "create returned an error")
+			} else {
+				dir, name := SplitPath(path)
+				nodeChildren[dir] = append(nodeChildren[dir], name)
+				nodeData[path] = data
+				ops = append(ops, GetDataOp(path), GetChildrenOp(path))
+			}
+		}
+
+		root := "/gozk-test"
+		create(root, nil)
+
+		for i := byte(0); i < 10; i++ {
+			child := JoinPath(root, fmt.Sprint(i))
+			create(child, []byte{i})
+		}
+
+		const foo = "foo"
+		create(JoinPath(JoinPath(root, "0"), foo), []byte(foo))
+
+		opResults, err := zk.MultiRead(ops...)
+		if err != nil {
+			t.Fatalf("MultiRead returned error: %+v", err)
+		} else if len(opResults) != len(ops) {
+			t.Fatalf("Expected %d responses got %d", len(ops), len(opResults))
+		}
+
+		nodeStats := map[string]*Stat{}
+		for k := range nodeData {
+			_, nodeStats[k], err = zk.Exists(k)
+			requireNoErrorf(t, err, "exists returned an error")
+		}
+
+		for i, res := range opResults {
+			opPath := ops[i].GetPath()
+			switch op := ops[i].(type) {
+			case GetDataOp:
+				if res.Err != nil {
+					t.Fatalf("GetDataOp(%q) returned an error: %+v", op, res.Err)
+				}
+				if !bytes.Equal(res.Data, nodeData[opPath]) {
+					t.Fatalf("GetDataOp(%q).Data did not return %+v, got %+v", op, nodeData[opPath], res.Data)
+				}
+				if !reflect.DeepEqual(res.Stat, nodeStats[opPath]) {
+					t.Fatalf("GetDataOp(%q).Stat did not return %+v, got %+v", op, nodeStats[opPath], res.Stat)
+				}
+			case GetChildrenOp:
+				if res.Err != nil {
+					t.Fatalf("GetChildrenOp(%q) returned an error: %+v", opPath, res.Err)
+				}
+				// Cannot use DeepEqual here because it fails for []string{} == nil, even though in practice they are
+				// the same.
+				actual, expected := res.Children, nodeChildren[opPath]
+				if len(actual) != len(expected) {
+					t.Fatalf("GetChildrenOp(%q) did not return %+v, got %+v", opPath, expected, actual)
+				}
+				sort.Strings(actual)
+				sort.Strings(expected)
+				for i, c := range expected {
+					if actual[i] != c {
+						t.Fatalf("GetChildrenOp(%q) did not return %+v, got %+v", opPath, expected, actual)
+					}
+				}
+			}
+		}
+
+		opResults, err = zk.MultiRead(GetDataOp("/invalid"), GetDataOp(root))
+		requireNoErrorf(t, err, "MultiRead returned error")
+
+		if opResults[0].Err != ErrNoNode {
+			t.Fatalf("MultiRead on invalid node did not return error")
+		}
+		if opResults[1].Err != nil {
+			t.Fatalf("MultiRead on valid node did not return error")
+		}
+		if !reflect.DeepEqual(opResults[1].Data, nodeData[root]) {
+			t.Fatalf("MultiRead on valid node did not return correct data")
+		}
+	})
+}
+
+func TestGetDataAndChildren(t *testing.T) {
+	RequireMinimumZkVersion(t, "3.6")
+	WithTestCluster(t, 10*time.Second, func(ts *TestCluster, zk *Conn) {
+
+		const path = "/test"
+		_, _, _, err := zk.GetDataAndChildren(path)
+		if err != ErrNoNode {
+			t.Fatalf("GetDataAndChildren(%q) did not return an error", path)
+		}
+
+		create := func(path string, data []byte) {
+			if _, err := zk.Create(path, data, 0, nil); err != nil {
+				requireNoErrorf(t, err, "create returned an error")
+			}
+		}
+		expectedData := []byte{1, 2, 3, 4}
+		create(path, expectedData)
+		var expectedChildren []string
+		for i := 0; i < 10; i++ {
+			child := fmt.Sprint(i)
+			create(JoinPath(path, child), nil)
+			expectedChildren = append(expectedChildren, child)
+		}
+
+		data, _, children, err := zk.GetDataAndChildren(path)
+		requireNoErrorf(t, err, "GetDataAndChildren return an error")
+
+		if !bytes.Equal(data, expectedData) {
+			t.Fatalf("GetDataAndChildren(%q) did not return expected data (expected %v): %v", path, expectedData, data)
+		}
+		sort.Strings(children)
+		if !reflect.DeepEqual(children, expectedChildren) {
+			t.Fatalf("GetDataAndChildren(%q) did not return expected children (expected %v): %v",
+				path, expectedChildren, children)
+		}
+	})
+}
+
 func TestIfAuthdataSurvivesReconnect(t *testing.T) {
 	// This test case ensures authentication data is being resubmited after
 	// reconnect.
@@ -438,6 +567,121 @@ func TestIfAuthdataSurvivesReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetching data after reconnect failed: %+v", err)
 	}
+}
+
+func TestPersistentWatchOnReconnect(t *testing.T) {
+	RequireMinimumZkVersion(t, "3.6")
+	WithTestCluster(t, 10*time.Second, func(ts *TestCluster, zk *Conn) {
+		zk.reconnectLatch = make(chan struct{})
+
+		zk2, _, err := ts.ConnectAll()
+		if err != nil {
+			t.Fatalf("Connect returned error: %+v", err)
+		}
+		defer zk2.Close()
+
+		const testNode = "/gozk-test"
+
+		if err := zk.Delete(testNode, -1); err != nil && err != ErrNoNode {
+			t.Fatalf("Delete returned error: %+v", err)
+		}
+
+		watchEventsCh, err := zk.AddPersistentWatch(testNode, AddWatchModePersistent)
+		if err != nil {
+			t.Fatalf("AddPersistentWatch returned error: %+v", err)
+		}
+
+		_, err = zk2.Create(testNode, []byte{1}, 0, WorldACL(PermAll))
+		if err != nil {
+			t.Fatalf("Create returned an error: %+v", err)
+		}
+
+		// check to see that we received the node creation event
+		select {
+		case ev := <-watchEventsCh:
+			if ev.Type != EventNodeCreated {
+				t.Fatalf("Second event on persistent watch was not a node creation event: %+v", ev)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("Persistent watcher for %q did not receive node creation event", testNode)
+		}
+
+		// Simulate network error by brutally closing the network connection.
+		zk.conn.Close()
+
+		_, err = zk2.Set(testNode, []byte{2}, -1)
+		if err != nil {
+			t.Fatalf("Set returned error: %+v", err)
+		}
+
+		// zk should still be waiting to reconnect, so none of the watches should have been triggered
+		select {
+		case <-watchEventsCh:
+			t.Fatalf("Persistent watcher for %q should not have triggered yet", testNode)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		// now we let the reconnect occur and make sure it resets watches
+		close(zk.reconnectLatch)
+
+		// wait for reconnect event
+		select {
+		case ev := <-watchEventsCh:
+			if ev.Type != EventWatching {
+				t.Fatalf("Persistent watcher did not receive reconnect event: %+v", ev)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Persistent watcher for %q did not receive connection event", testNode)
+		}
+
+		eventsReceived := 0
+		timeout := time.After(2 * time.Second)
+		secondTimeout := time.After(4 * time.Second)
+		for {
+			select {
+			case e := <-watchEventsCh:
+				if e.Type != EventNodeDataChanged {
+					t.Fatalf("Unexpected event received by persistent watcher: %+v", e)
+				}
+				eventsReceived++
+			case <-timeout:
+				_, err = zk2.Set(testNode, []byte{3}, -1)
+				if err != nil {
+					t.Fatalf("Set returned error: %+v", err)
+				}
+			case <-secondTimeout:
+				switch eventsReceived {
+				case 2:
+					t.Fatalf("Sanity check failed: the persistent watch logic is based around the assumption that the " +
+						"setWatchers call _does not_ bootstrap you on reconnect based on the relative Zxid (unlike " +
+						"standard watches).")
+				case 1:
+					return
+				default:
+					t.Fatalf("Received no events after reconnect")
+				}
+			}
+		}
+	})
+}
+
+func TestPersistentWatchOnClose(t *testing.T) {
+	RequireMinimumZkVersion(t, "3.6")
+	WithTestCluster(t, 10*time.Second, func(_ *TestCluster, zk *Conn) {
+		ch, err := zk.AddPersistentWatch("/", AddWatchModePersistent)
+		if err != nil {
+			t.Fatalf("Could not add persistent watch: %+v", err)
+		}
+		zk.Close()
+		select {
+		case e := <-ch:
+			if e.Type != EventNotWatching {
+				t.Fatalf("Unexpected event: %+v", e)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Did not get disconnect event")
+		}
+	})
 }
 
 func TestMultiFailures(t *testing.T) {
