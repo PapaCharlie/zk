@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,6 +34,38 @@ type TestCluster struct {
 	Path    string
 	Config  ServerConfig
 	Servers []TestServer
+}
+
+func WithTestCluster(t *testing.T, testTimeout time.Duration, f func(ts *TestCluster, zk *Conn)) {
+	ts, err := StartTestCluster(t, 1, nil, logWriter{t: t, p: "[ZKERR] "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ts.Stop()
+	})
+	zk, _, err := ts.ConnectAll()
+	if err != nil {
+		t.Fatalf("Connect returned error: %+v", err)
+	}
+	t.Cleanup(func() {
+		zk.Close()
+	})
+	doneChan := make(chan struct{})
+	go func() {
+		defer func() {
+			close(doneChan)
+			if r := recover(); r != nil {
+				t.Error(string(debug.Stack()))
+			}
+		}()
+		f(ts, zk)
+	}()
+	select {
+	case <-doneChan:
+	case <-time.After(testTimeout):
+		t.Fatalf("Test did not complete within timeout")
+	}
 }
 
 // TODO: pull this into its own package to allow for better isolation of integration tests vs. unit
